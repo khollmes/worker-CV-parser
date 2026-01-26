@@ -1,0 +1,6 @@
+runpod>=1.7.0
+torch>=2.3.0
+transformers>=4.51.0
+accelerate>=0.33.0
+huggingface_hub>=0.24.0
+safetensors>=0.4.3
