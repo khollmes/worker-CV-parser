@@ -13,12 +13,48 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # -------------------------
 # Logging setup
 # -------------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()
+LOG_FULL_PAYLOADS = os.getenv("LOG_FULL_PAYLOADS", "true").lower() in ("1", "true", "yes", "on")
+LOG_PREVIEW_CHARS = int(os.getenv("LOG_PREVIEW_CHARS", "800"))
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    force=True,
 )
+logging.captureWarnings(True)
 logger = logging.getLogger("smartresume")
+
+
+def _safe_json_dumps(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=True, default=str)
+    except Exception as exc:
+        return f"<unserializable:{type(obj).__name__} err={exc}>"
+
+
+def _preview_text(text: Optional[str]) -> str:
+    if text is None:
+        return "<none>"
+    s = str(text)
+    if LOG_FULL_PAYLOADS:
+        return s
+    if len(s) <= LOG_PREVIEW_CHARS:
+        return s
+    return f"{s[:LOG_PREVIEW_CHARS]}...<truncated {len(s) - LOG_PREVIEW_CHARS} chars>"
+
+
+def _log_text(label: str, text: Optional[str], level: int = logging.DEBUG) -> None:
+    if not logger.isEnabledFor(level):
+        return
+    raw = "" if text is None else str(text)
+    preview = _preview_text(raw)
+    logger.log(level, "%s (%d chars): %s", label, len(raw), preview)
+
+
+logger.info(
+    "Logging configured | level=%s full_payloads=%s preview_chars=%d",
+    LOG_LEVEL, LOG_FULL_PAYLOADS, LOG_PREVIEW_CHARS
+)
 
 # -------------------------
 # Model config
@@ -39,6 +75,16 @@ MAX_NEW_TOKENS_WORK = int(os.getenv("MAX_NEW_TOKENS_WORK", "650"))
 REPAIR_ATTEMPTS_DEFAULT = int(os.getenv("REPAIR_ATTEMPTS", "2"))
 TEMPERATURE_DEFAULT = float(os.getenv("TEMPERATURE", "0.0"))
 REPETITION_PENALTY_DEFAULT = float(os.getenv("REPETITION_PENALTY", "1.01"))
+
+logger.info(
+    "Model config | repo=%s subfolder=%s cache_dir=%s model_path=%s device=%s dtype=%s",
+    REPO_ID, SUBFOLDER, MODEL_CACHE_DIR, MODEL_PATH, DEVICE, DTYPE
+)
+logger.info(
+    "Defaults | max_basic=%d max_edu=%d max_work=%d repair=%d temp=%.3f rep=%.3f",
+    MAX_NEW_TOKENS_BASIC, MAX_NEW_TOKENS_EDU, MAX_NEW_TOKENS_WORK,
+    REPAIR_ATTEMPTS_DEFAULT, TEMPERATURE_DEFAULT, REPETITION_PENALTY_DEFAULT
+)
 
 # -------------------------
 # JSON helpers (strict + defensive)
@@ -111,7 +157,8 @@ def parse_json_strict(text: str) -> Dict[str, Any]:
         if isinstance(obj4, dict):
             return obj4
 
-    logger.error("parse_json_strict failed; cleaned snippet: %s", cleaned[:500])
+    logger.error("parse_json_strict failed; cleaned length=%d", len(cleaned))
+    _log_text("parse_json_strict cleaned", cleaned, level=logging.ERROR)
     raise ValueError("Invalid JSON output")
 
 # -------------------------
@@ -188,9 +235,11 @@ model = None
 
 
 def download_model_if_needed() -> None:
-    if os.path.isdir(MODEL_PATH) and os.path.exists(os.path.join(MODEL_PATH, "config.json")):
+    cfg_path = os.path.join(MODEL_PATH, "config.json")
+    if os.path.isdir(MODEL_PATH) and os.path.exists(cfg_path):
         logger.info("Model already present at %s", MODEL_PATH)
         return
+    logger.info("Model not found at %s (config: %s)", MODEL_PATH, cfg_path)
     logger.info("Downloading model %s to %s", REPO_ID, MODEL_CACHE_DIR)
     os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
     snapshot_download(
@@ -219,12 +268,23 @@ def init() -> None:
     t0 = time.time()
     download_model_if_needed()
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+    logger.info(
+        "Tokenizer loaded | class=%s vocab=%s model_max_length=%s",
+        tokenizer.__class__.__name__,
+        getattr(tokenizer, "vocab_size", None),
+        getattr(tokenizer, "model_max_length", None),
+    )
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH,
         torch_dtype=DTYPE,
         device_map="auto" if DEVICE == "cuda" else None,
         trust_remote_code=True,
     )
+    logger.info("Model loaded | class=%s", model.__class__.__name__)
+    cfg = getattr(model, "config", None)
+    if cfg is not None:
+        cfg_payload = cfg.to_dict() if hasattr(cfg, "to_dict") else cfg
+        _log_text("Model config", _safe_json_dumps(cfg_payload))
     model.eval()
     logger.info("Model initialized on device=%s in %.2fs", DEVICE, time.time() - t0)
 
@@ -233,6 +293,8 @@ def generate_text(prompt: str, max_new_tokens: int, temperature: float, repetiti
     max_ctx = _get_max_ctx()
     safety = 32
 
+    logger.debug("Prompt chars=%d", len(prompt))
+    _log_text("Prompt", prompt)
     enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_ctx - safety)
     input_len = int(enc["input_ids"].shape[1])
     allowed_new = min(max_new_tokens, max(0, max_ctx - input_len - safety))
@@ -244,8 +306,8 @@ def generate_text(prompt: str, max_new_tokens: int, temperature: float, repetiti
     do_sample = temperature > 0.0
 
     logger.debug(
-        "Generating text | max_new=%d allowed_new=%d temp=%.3f rep=%.3f",
-        max_new_tokens, allowed_new, temperature, repetition_penalty
+        "Generating text | max_new=%d allowed_new=%d temp=%.3f rep=%.3f input_tokens=%d max_ctx=%d",
+        max_new_tokens, allowed_new, temperature, repetition_penalty, input_len, max_ctx
     )
 
     t0 = time.time()
@@ -264,6 +326,8 @@ def generate_text(prompt: str, max_new_tokens: int, temperature: float, repetiti
     decoded = tokenizer.decode(out[0], skip_special_tokens=True)
     if decoded.startswith(prompt):
         decoded = decoded[len(prompt):]
+    logger.debug("Decoded chars=%d", len(decoded))
+    _log_text("Decoded output", decoded)
     return decoded.strip()
 
 
@@ -286,6 +350,8 @@ def run_task(
         "Running task=%s | max_new=%d temp=%.3f rep=%.3f repair_attempts=%d",
         task_name, max_new_tokens, temperature, repetition_penalty, repair_attempts
     )
+    logger.debug("Task=%s expected_keys=%s", task_name, expected_keys)
+    _log_text(f"Task {task_name} prompt", prompt_text)
 
     raw = generate_text(
         prompt_text,
@@ -294,7 +360,7 @@ def run_task(
         repetition_penalty=repetition_penalty,
     )
 
-    logger.debug("Raw generation (%s) preview: %s", task_name, raw[:400])
+    _log_text(f"Raw generation {task_name}", raw)
 
     cleaned = _basic_json_cleanup(raw)
     ok_shape = cleaned.startswith("{") and cleaned.endswith("}")
@@ -319,6 +385,7 @@ def run_task(
         for i in range(1, repair_attempts + 1):
             attempts_used = i
             rep = repair_prompt(task_name, last, expected_keys)
+            _log_text(f"Repair prompt {task_name} attempt={i}", rep)
             last = generate_text(
                 rep,
                 max_new_tokens=max(160, max_new_tokens // 2),
@@ -326,7 +393,7 @@ def run_task(
                 repetition_penalty=repetition_penalty,
             )
             last_clean = _basic_json_cleanup(last)
-            logger.debug("Repair attempt %d (%s) preview: %s", i, task_name, last_clean[:400])
+            _log_text(f"Repair output {task_name} attempt={i}", last_clean)
 
             if last_clean.startswith("{") and last_clean.endswith("}"):
                 try:
@@ -356,15 +423,24 @@ def run_task(
 # -------------------------
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     t0 = time.time()
+    logger.debug("Raw job payload: %s", _safe_json_dumps(job))
     job_id = job.get("id") or job.get("job_id")
     logger.info("Received job id=%s", job_id)
 
     inp = job.get("input", {}) or {}
     logger.debug("Job input keys: %s", list(inp.keys()))
+    logger.debug("Job input payload: %s", _safe_json_dumps(inp))
 
     part_basic = inp.get("part_basic", "")
     part_edu = inp.get("part_education", "")
     part_work = inp.get("part_work", "")
+    logger.info(
+        "Job id=%s parts length | basic=%d edu=%d work=%d",
+        job_id, len(part_basic), len(part_edu), len(part_work)
+    )
+    _log_text("part_basic", part_basic)
+    _log_text("part_education", part_edu)
+    _log_text("part_work", part_work)
 
     if not isinstance(part_basic, str) or not isinstance(part_edu, str) or not isinstance(part_work, str):
         logger.warning("Bad request: non-string parts")
@@ -391,6 +467,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
     indexed_text = build_indexed_text_from_parts(part_basic, part_edu, part_work)
     logger.debug("Indexed text length: %d chars", len(indexed_text))
+    _log_text("indexed_text", indexed_text)
 
     basic_out, basic_meta = run_task(
         task_name="basicInfo",
@@ -438,6 +515,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         }
         if return_indexed:
             resp["indexed_text"] = indexed_text
+        _log_text("response_error", _safe_json_dumps(resp))
         return resp
 
     final = empty_final_schema()
@@ -457,6 +535,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     if return_indexed:
         resp_ok["indexed_text"] = indexed_text
 
+    _log_text("response_ok", _safe_json_dumps(resp_ok))
     logger.info("Job id=%s completed in %.3fs", job_id, time.time() - t0)
     return resp_ok
 
