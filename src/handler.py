@@ -457,66 +457,31 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
     indexed_text = build_indexed_text_from_parts(part_basic, part_edu, part_work)
 
-    # 3 prompts (sequential for GPU stability; easiest to debug)
-    basic_out, basic_meta = run_task(
-        task_name="basicInfo",
-        prompt_text=prompt_basic(indexed_text),
-        expected_keys=["basicInfo"],
+    # 3 prompts (sequential for GPU stability; raw model outputs only)
+    basic_raw = generate_text(
+        prompt_basic(indexed_text),
         max_new_tokens=max_basic,
         temperature=temperature,
         repetition_penalty=repetition_penalty,
-        repair_attempts=repair_attempts,
     )
-
-    edu_out, edu_meta = run_task(
-        task_name="education",
-        prompt_text=prompt_education(indexed_text),
-        expected_keys=["education"],
+    edu_raw = generate_text(
+        prompt_education(indexed_text),
         max_new_tokens=max_edu,
         temperature=temperature,
         repetition_penalty=repetition_penalty,
-        repair_attempts=repair_attempts,
     )
-
-    work_out, work_meta = run_task(
-        task_name="workExperience",
-        prompt_text=prompt_work(indexed_text),
-        expected_keys=["workExperience"],
+    work_raw = generate_text(
+        prompt_work(indexed_text),
         max_new_tokens=max_work,
         temperature=temperature,
         repetition_penalty=repetition_penalty,
-        repair_attempts=repair_attempts,
     )
 
-    # If any task failed, return a clear failure envelope (with raw previews)
-    if basic_out is None or edu_out is None or work_out is None:
-        resp = {
-            "error": "model_output_not_valid_json",
-            "meta": {
-                "basic": basic_meta,
-                "education": edu_meta,
-                "work": work_meta,
-                "latency_s": round(time.time() - t0, 3),
-            },
-        }
-        if return_indexed:
-            resp["indexed_text"] = indexed_text
-        return resp
-
-    # Merge into final schema
-    final = empty_final_schema()
-    final["basicInfo"] = basic_out.get("basicInfo", final["basicInfo"])
-    final["education"] = edu_out.get("education", [])
-    final["workExperience"] = work_out.get("workExperience", [])
-
     resp_ok = {
-        "data": final,
-        "meta": {
-            "basic": basic_meta,
-            "education": edu_meta,
-            "work": work_meta,
-            "latency_s": round(time.time() - t0, 3),
-        },
+        "basic": basic_raw,
+        "education": edu_raw,
+        "work": work_raw,
+        "latency_s": round(time.time() - t0, 3),
     }
     if return_indexed:
         resp_ok["indexed_text"] = indexed_text
