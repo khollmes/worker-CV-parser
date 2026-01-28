@@ -225,6 +225,79 @@ def _apply_template(tok, system: str, user: str) -> str:
         return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     return system + "\n" + user + "\n"
 
+# -------------------------
+# Prompt builders
+# -------------------------
+def _build_prompt(task_description: str, indexed_text: str) -> str:
+    return "\n".join(
+        [
+            MICRO_OPT_LINES,
+            task_description.strip(),
+            "",
+            "Indexed text (already normalized, one line per entry):",
+            indexed_text or "",
+        ]
+    )
+
+
+def prompt_basic(indexed_text: str) -> str:
+    task = """
+Return a strict JSON object with exactly one key, "basicInfo".
+Inside "basicInfo" provide the following properties: name, personalEmail,
+phoneNumber, age, born, gender, desiredLocation, jobIntention,
+currentLocation, placeOfOrigin. Use strings for scalar values and arrays
+for the multi-valued fields (e.g., desiredLocation). If information is
+missing, return an empty string or empty array as appropriate. Do not
+wrap responses in markdown code fences or add any extra commentary.
+"""
+    prompt = _build_prompt(task, indexed_text)
+    return _apply_template(tokenizer, SYSTEM_STRICT_JSON, prompt)
+
+
+def prompt_education(indexed_text: str) -> str:
+    task = """
+Return a strict JSON object with exactly one key, "education".
+The value must be an array of education records ordered newest first.
+Each record should contain: institution, degree, major, startDate,
+endDate, and summary. Use ISO-style dates when available, empty strings
+when unknown, and a list of short summary sentences if you can infer any
+coursework or honors. Only output the JSON object (no prose or markup).
+"""
+    prompt = _build_prompt(task, indexed_text)
+    return _apply_template(tokenizer, SYSTEM_STRICT_JSON, prompt)
+
+
+def prompt_work(indexed_text: str) -> str:
+    task = """
+Return a strict JSON object with exactly one key, "workExperience".
+The value must be an array of job records ordered newest first.
+Each record should include: company, title, startDate, endDate, and summary.
+Populate summary with a list of short sentences describing responsibilities
+or accomplishments. Use empty strings or [] when details are absent, and
+only output the JSON object.
+"""
+    prompt = _build_prompt(task, indexed_text)
+    return _apply_template(tokenizer, SYSTEM_STRICT_JSON, prompt)
+
+
+def repair_prompt(
+    task_name: str,
+    previous_output: str,
+    expected_keys: List[str],
+    indexed_text: str,
+) -> str:
+    task = f"""
+We previously asked for a JSON object with exactly the keys {expected_keys}.
+The last model output was:
+{previous_output or "<empty>"}
+Please re-read the indexed text and return a clean JSON object that
+matches the expected schema (one top-level key {expected_keys}),
+contains only valid JSON characters, and keeps values for any fields you
+can recover. Do not add any explanation or markdown.
+"""
+    prompt = _build_prompt(task, indexed_text or "")
+    return _apply_template(tokenizer, SYSTEM_STRICT_JSON, prompt)
+
 # prompt_basic / prompt_education / prompt_work / repair_prompt unchanged...
 
 # -------------------------
@@ -344,6 +417,7 @@ def run_task(
     temperature: float,
     repetition_penalty: float,
     repair_attempts: int,
+    context_text: str,
 ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
     t0 = time.time()
     logger.info(
@@ -384,7 +458,7 @@ def run_task(
         logger.info("Task=%s entering repair loop", task_name)
         for i in range(1, repair_attempts + 1):
             attempts_used = i
-            rep = repair_prompt(task_name, last, expected_keys)
+            rep = repair_prompt(task_name, last, expected_keys, context_text)
             _log_text(f"Repair prompt {task_name} attempt={i}", rep)
             last = generate_text(
                 rep,
@@ -477,6 +551,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         temperature=temperature,
         repetition_penalty=repetition_penalty,
         repair_attempts=repair_attempts,
+        context_text=indexed_text,
     )
 
     edu_out, edu_meta = run_task(
@@ -487,6 +562,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         temperature=temperature,
         repetition_penalty=repetition_penalty,
         repair_attempts=repair_attempts,
+        context_text=indexed_text,
     )
 
     work_out, work_meta = run_task(
@@ -497,6 +573,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         temperature=temperature,
         repetition_penalty=repetition_penalty,
         repair_attempts=repair_attempts,
+        context_text=indexed_text,
     )
 
     if basic_out is None or edu_out is None or work_out is None:
